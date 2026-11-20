@@ -1,0 +1,25 @@
+# ClearGuard 0.1.0 · 实验预览版
+
+Offline duplicate finder for macOS and Windows. MIT licensed.
+
+- 多项内容核验：大小、完整 SHA-256、逐字节比较，以及清理前文件身份/内容复核。
+- 默认不选文件。完整路径预览后，用户明确确认才移入系统回收站；每组固定保留至少一份。
+- 开发项目、系统、应用包、已知云目录、链接、硬链接和云占位文件保守排除。
+- 大文件与旧文件仅提示；不推断“无用”，不清运行内存，不清空回收站。
+- 本地审计日志。无遥测，无上传，无管理员权限要求。
+
+## 下载
+
+- Apple Silicon Mac：`ClearGuard-macos-arm64.zip`
+- Intel Mac：`ClearGuard-macos-x86_64.zip`
+- Windows x64：`ClearGuard-windows-x64.zip`
+
+解压完整压缩包后运行 `.app` 或 `ClearGuard/ClearGuard.exe`。程序依赖随包提供，无需自行安装 Python。请保留 Windows 程序旁的依赖目录。
+
+本预览版未做 Apple 开发者签名/公证或 Windows 商业代码签名。首次使用请先用可恢复的测试文件；不要关闭系统安全保护。源码运行方法见 README。
+
+## 验证与边界
+
+发布任务只会在三平台安全测试、源码 UI 测试、打包和打包后 UI 启动测试全部成功后上传压缩包。清理测试使用合成文件与模拟回收站，未验证所有真实磁盘、外接盘和回收站配置。
+
+内容相同不代表用途相同。回收站仍占磁盘空间；应用不会自动腾空它。并发修改路径仍有竞争窗口，请停止相关写入/同步。完整限制见 README 与 SECURITY.md。

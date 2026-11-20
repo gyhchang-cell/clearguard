@@ -61,7 +61,7 @@ python -m pip install --cache-dir .cache/pip -e ".[build]"
 python build.py
 ```
 
-PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-14`) and Windows x64 (`windows-latest`), then uploads native artifacts. An Intel Mac build is not included yet. The workflow is not evidence of successful validation until its run is green. Download the entire platform artifact, extract it, and run `ClearGuard.app` or `ClearGuard/ClearGuard.exe`; do not move the executable away from its companion files.
+PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-15`), Intel (`macos-15-intel`) and Windows x64 (`windows-latest`), then uploads native artifacts. The workflow is not evidence of successful validation until its run is green. Download the platform ZIP from Releases, extract it, and run `ClearGuard.app` or `ClearGuard/ClearGuard.exe`; do not move the executable away from its companion files.
 
 All configurable caches, virtual environments, build products and disposable fixtures stay inside the project. Safety tests use a fake trash backend and disposable fixtures; they never touch personal files or the real Trash. The GUI smoke test opens the actual native Tk UI and confirms empty default selection and the review dialog without executing cleanup.
 

@@ -291,7 +291,8 @@ class App:
         file = filedialog.asksaveasfilename(title='导出报告：包含本机文件路径，请谨慎分享', initialdir=str(self.result.root), initialfile='clearguard-report.json', defaultextension='.json')
         if file:
             try:
-                Path(file).write_text(json.dumps(asdict(self.result), default=str, ensure_ascii=False, indent=2), encoding='utf-8')
+                with Path(file).open('x', encoding='utf-8') as report:
+                    report.write(json.dumps(asdict(self.result), default=str, ensure_ascii=False, indent=2))
             except OSError as error:
                 messagebox.showerror('导出失败', str(error))
 
@@ -303,10 +304,16 @@ class App:
         self.root.destroy()
 
 
-def main():
+def main(smoke=False):
     root = tk.Tk()
-    App(root)
-    root.mainloop()
+    app = App(root)
+    if smoke:
+        root.update()
+        assert not app.chosen and app.result is None
+        assert str(app.clear['state']) == 'disabled'
+        root.destroy()
+    else:
+        root.mainloop()
 
 
 if __name__ == '__main__':
