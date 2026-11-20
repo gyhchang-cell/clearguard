@@ -30,6 +30,7 @@ class SafetyTests(unittest.TestCase):
         if third:
             self.c = self.file('c')
         self.r = core.scan(self.root)
+        self.assertTrue(self.r.groups, repr(self.r))
         self.plan = core.make_plan(self.r, [self.b, self.c] if third else [self.b])
         self.calls = []
     def execute(self, trash=None, audit=None, consent=None):
@@ -142,6 +143,22 @@ class ComputerScanTests(unittest.TestCase):
         self.assertEqual(r.scanned, 1)
         self.assertEqual(r.skipped, 2)
         self.assertFalse(r.groups)
+
+    def test_fresh_file_snapshot_matches_open_handle(self):
+        original_digest = core.digest
+        def measured(item, cancel=None):
+            try:
+                return original_digest(item, cancel)
+            except core.UnsafeFile as error:
+                with item.path.open('rb') as stream:
+                    actual = os.fstat(stream.fileno())
+                raise AssertionError(f'{error}; snapshot={item!r}; handle={actual!r}; '
+                                     f'handle_ns={(actual.st_mtime_ns, actual.st_ctime_ns)!r}') from error
+        for i in range(50):
+            self.file(f'fresh-{i}/a'); self.file(f'fresh-{i}/b')
+            with patch.object(core, 'digest', side_effect=measured):
+                r = core.scan(self.root / f'fresh-{i}')
+            self.assertEqual(len(r.groups), 1, repr(r))
 
     def test_cross_volume_duplicates_grouped_once(self):
         self.file('volume-a/original'); copy = self.file('volume-b/copy')
