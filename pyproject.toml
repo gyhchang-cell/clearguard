@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clearguard-desktop"
-version = "0.0.0.dev0"
+version = "0.0.1"
 description = "Offline duplicate finder with evidence, explicit consent and native Trash"
 readme = "README.md"
 requires-python = ">=3.11"

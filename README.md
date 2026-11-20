@@ -8,7 +8,17 @@ ClearGuard 按实际内容查找重复文件。扫描后可以直接逐项勾选
 
 [从源码运行](#快速运行) · [扫描算法](#扫描算法) · [复现性能测试](#复现性能测试) · [参与贡献](CONTRIBUTING.md)
 
-> 当前为开发源码。正式安装包将在首个正式版本发布时提供。
+## 下载安装
+
+下载后可直接使用，无需单独安装 Python。
+
+| 平台 | 下载 | 打开方式 |
+|---|---|---|
+| Mac（Apple 芯片） | [Apple 芯片 DMG](https://github.com/gyhchang-cell/clearguard/releases/download/v0.0.1/ClearGuard-0.0.1-macos-arm64.dmg) | 打开 DMG，把 ClearGuard 拖到「应用程序」 |
+| Mac（Intel 芯片） | [Intel DMG](https://github.com/gyhchang-cell/clearguard/releases/download/v0.0.1/ClearGuard-0.0.1-macos-x86_64.dmg) | 打开 DMG，把 ClearGuard 拖到「应用程序」 |
+| Windows x64 | [安装程序](https://github.com/gyhchang-cell/clearguard/releases/download/v0.0.1/ClearGuard-0.0.1-windows-x64-setup.exe) · [免安装 ZIP](https://github.com/gyhchang-cell/clearguard/releases/download/v0.0.1/ClearGuard-0.0.1-windows-x64-portable.zip) | 安装后从开始菜单打开，或解压 ZIP 后打开 ClearGuard.exe |
+
+[首版更新说明和 SHA-256 校验文件](https://github.com/gyhchang-cell/clearguard/releases/tag/v0.0.1)。本版未做 Apple Developer ID 公证或 Windows Authenticode 签名。系统可能提示未识别开发者。
 
 ## 扫描算法
 
@@ -67,7 +77,7 @@ Windows PowerShell（无需修改执行策略）：
 5. 已知云目录只按名称和系统占位标志保守排除；自定义同步位置无法全部识别，请自行避开。
 6. 批量操作不是事务：中途失败停止后，已经移入回收站的文件不会自动恢复；查看日志与系统回收站。日志存在 `intent` 而无结果时，应人工核查该路径。
 7. 不请求管理员权限、不强行绕过 macOS 隐私设置；外接盘不支持回收站时清理失败，不永久删除。
-8. 当前 UI 为中文；macOS 构建未进行 Apple 签名/公证，Windows 构建未签名。请勿把预览版当作经过商业签名的正式安装器。
+8. 当前界面为简体中文。macOS 构建为临时签名，未经过 Apple Developer ID 公证，Windows 构建未做 Authenticode 签名。
 
 ## Development / 开发
 
@@ -81,7 +91,7 @@ python package.py
 python verify_bundle.py
 ```
 
-PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-15`), Intel (`macos-15-intel`) and Windows x64 (`windows-latest`), without publishing releases or downloadable artifacts. The workflow is not evidence of successful validation until its run is green. When the user has approved a future release, extract the platform ZIP and run `ClearGuard.app` or `ClearGuard/ClearGuard.exe`; do not move the executable away from its companion files.
+PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-15`), Intel (`macos-15-intel`) and Windows x64 (`windows-latest`), without publishing releases or downloadable artifacts. The workflow is not evidence of successful validation until its run is green. Distribution installers are built and exercised by the separate [installer workflow](.github/workflows/package-installers.yml). Windows portable builds keep the executable alongside its companion files.
 
 All configurable caches, virtual environments, build products and disposable fixtures stay inside the project. Safety tests use a fake trash backend and disposable fixtures; they never touch personal files or the real Trash. The GUI smoke test opens the actual native Tk UI and confirms empty default selection, the review dialog, and the Whole-computer Scan button/worker flow using a mocked scan result, without scanning real disks or executing cleanup.
 
@@ -104,4 +114,4 @@ MIT. See [LICENSE](LICENSE).
 
 `verify_bundle.py` 检查压缩包 CRC、解压到项目内独立 QA 目录，然后运行实际打包应用的磁盘依赖加载、文件夹扫描、跨目录扫描、确认保护、取消和测试文件清理/恢复流程。磁盘发现读取本机挂载元数据；文件扫描只针对自动创建的测试文件。清理使用测试目录内的移动适配器，不操作用户回收站。未覆盖的真实磁盘/权限/回收站组合不能被宣称全部验证。
 
-本仓库提供可自行运行和构建的源码。内部构建元数据 `0.0.0.dev0` 用于开发测试。
+运行 `python build.py --release` 和 `python installers/package_release.py` 可在目标平台构建并验证安装包。

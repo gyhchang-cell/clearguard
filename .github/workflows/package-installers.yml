@@ -1,0 +1,40 @@
+name: Build and verify installers
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            artifact: macos-arm64
+          - os: macos-15-intel
+            artifact: macos-x86_64
+          - os: windows-latest
+            artifact: windows-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.cache/pycache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e ".[build]"
+      - run: python -m unittest discover -s tests -v
+      - run: python tests/gui_smoke.py
+      - run: python build.py --release
+      - name: Package and exercise install
+        id: package
+        run: python installers/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clearguard-${{ matrix.artifact }}
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
