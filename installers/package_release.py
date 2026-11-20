@@ -49,8 +49,11 @@ def write_licenses(folder):
             break
     else:
         raise RuntimeError('Missing Python license')
+    for license_file in sorted((ROOT / 'installers' / 'licenses').glob('*.txt')):
+        shutil.copy2(license_file, folder / license_file.name)
     (folder / 'Runtime-sources.txt').write_text(
-        'Tk / Tcl: https://www.tcl-lang.org/software/tcltk/license.html\n'
+        'Tcl: https://github.com/tcltk/tcl/blob/core-8-6-17/license.terms\n'
+        'Tk: https://github.com/tcltk/tk/blob/core-8-6-17/license.terms\n'
         'Python runtime: https://www.python.org/downloads/\n'
         'Windows installer: https://nsis.sourceforge.io/License\n', encoding='utf-8')
 
@@ -127,8 +130,14 @@ def windows_package(target, output, qa):
     run(installed / 'Uninstall.exe', '/S', f'_?={installed}')
     if (installed / 'ClearGuard.exe').exists() or not extra.exists():
         raise RuntimeError('Uninstall did not preserve unrelated files')
-    shutil.make_archive(str(output / f'ClearGuard-{__version__}-windows-x64-portable'),
-                        'zip', app.parent, app.name)
+    portable = shutil.make_archive(str(output / f'ClearGuard-{__version__}-windows-x64-portable'),
+                                  'zip', app.parent, app.name)
+    portable_qa = qa / 'portable'
+    with zipfile.ZipFile(portable) as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError('Portable archive CRC check failed')
+        archive.extractall(portable_qa)
+    selftest(portable_qa / 'ClearGuard' / 'ClearGuard.exe', portable_qa)
 
 
 def main():
