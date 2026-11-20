@@ -1,22 +1,36 @@
 # ClearGuard
 
-**空间有数，清理有据。** An offline, consent-first duplicate finder for macOS and Windows.
+**Find exact duplicate files across local disks. Review what stays before anything moves.**
 
-> 0.2.1 experimental preview / 实验预览版。先用可恢复的测试文件体验，再处理重要资料。
+ClearGuard is an offline desktop app for **macOS and Windows**, released as source under the [MIT license](LICENSE). Scan a folder or all supported local drives, then select individual copies or all copies in the filtered results. At least one copy stays in every group. After you confirm the paths, ClearGuard rechecks them and moves the selected files to the system Trash or Recycle Bin.
 
-ClearGuard scans a folder you choose or discovers local disks with Whole-computer Scan, shows exact duplicate evidence and lets you review a concrete cleanup plan. Nothing is selected by default. Cleanup sends explicitly approved duplicates to the native Trash / Recycle Bin. It never empties it or falls back to permanent deletion.
+ClearGuard 按实际内容查找重复文件。扫描后可以直接逐项勾选，也可以全选当前筛选结果中的副本。每组留一份，回收站操作前先核对文件路径。
 
-## 中文说明
+[从源码运行](#快速运行) · [扫描算法](#扫描算法) · [复现性能测试](#复现性能测试) · [参与贡献](CONTRIBUTING.md)
 
-- **全机扫描**：点击新增按钮自动扫描已挂载的本地磁盘（含 USB），统一查找跨磁盘重复文件。macOS 避免重复扫描 APFS 内部卷；Windows 跳过网络驱动器。保护目录、无权限目录、网络/虚拟文件系统、离线或未挂载磁盘不在覆盖范围内；界面与导出报告列出范围、排除项和错误。
-- **重复核验**：文件大小分组 → 完整 SHA-256 → 独立逐字节比较。名字相同不等于重复。
-- **执行前复核**：检查文件身份、大小、修改/元数据时间、哈希与内容，保留副本也要重新核验；变化即停止。
-- **明确同意**：手动选择 → 展示完整路径、保留副本、数量与大小 → 勾选确认 → 保存新的本地审计日志 → 执行。
-- **至少留一份**：界面固定保留每组第一份，底层拒绝清空整组。第一份只按遍历顺序确定，不代表更重要。
-- **保守排除**：系统目录、开发项目、应用包、已知云同步目录、云占位文件、符号链接、Windows 联接/重解析点、硬链接。
-- **“没用”不凭猜测**：大于 100 MiB 或修改时间超过 180 天的文件仅列为查看建议，不提供一键删除；日期不能证明没人使用。
-- **磁盘空间与 RAM 分开**：本项目分析文件占用的磁盘空间，不杀进程、不清运行内存。
-- **离线与隐私**：运行时不联网、不上传路径、不遥测。导出的报告和审计日志包含完整本机路径，请勿直接上传到公开 issue。
+> 当前为开发源码。正式安装包将在首个正式版本发布时提供。
+
+## 扫描算法
+
+1. **元数据分组。** 只把相同大小的普通文件放进候选组。按文件身份去重，保护链接、占位文件、系统目录和已知开发、应用与 Codex 数据目录。
+2. **稀疏抽样排除。** 对大于 128 KiB 的同尺寸文件读取首、中、尾的固定块。样本不同时退出，样本匹配时仍需内容核验。
+3. **小文件单次读取。** 可装入 16 MiB 预算的尺寸桶按完整字节分组，只为匹配组计算一次完整 SHA-256。超预算桶按流式 SHA-256 分组，再逐字节复核。
+4. **大文件分块细化。** 8 MiB 起，在最多 8 个文件的批次内，同时读取每个候选同一偏移处的块。匹配内容共享 SHA-256 的前缀状态，遇到不同内容则拆组。完整候选桶能装进单个批次时，已经成为单例的分支立即停止读取。跨批次只比较摘要相同的代表文件，并要求实际字节匹配。
+5. **清理独立复核。** 用户直接勾选并确认具体文件。每组至少有一份未勾选的保留副本，而且必须仍然存在、内容一致。macOS 检查操作系统可见的打开文件，Windows 检查独占打开是否失败。移动前复查内容和文件身份，记录到本地审计日志。
+
+文件名称、后缀和时间不参与重复判定。清理前另外核验 macOS 扩展属性和 AppleDouble 附加文件、Windows 命名数据流。占用、附加数据或文件变化会在清理预览中列为保留项。macOS 自动记录的 provenance 标记不阻挡清理。大文件与旧文件页只供查看。目录遍历显示已发现条目，校验阶段按读过或已排除的实际范围推进，状态行另显示真实读取量。
+
+一次本机对照使用 32 GiB 已分配数据，其中四个文件是完整副本，另外四个共享相同抽样内容但在非抽样处不同。新旧算法的分组与 SHA-256 一致。应用层内容读取量从 48.0 GiB 减少到 16.3 GiB，两次运行的中位耗时从 16.15 秒降到 3.52 秒。数据分布、缓存和存储设备会影响实际表现。
+
+### 复现性能测试
+
+安装依赖后，用同一个 Python 环境运行以下命令。脚本生成 8 个测试文件，4 个完全相同，另外 4 个的差异刻意避开抽样位置。脚本核对完整匹配组，并打印读取量与耗时。测试数据写入项目内的临时目录。
+
+```sh
+python benchmarks/scan.py
+```
+
+用 `--size-mib 4096` 可生成上述 32 GiB 对照所用的同类大文件场景。默认八个文件合计 128 MiB。
 
 ### 快速运行
 
@@ -40,11 +54,13 @@ Windows PowerShell（无需修改执行策略）：
 .venv\Scripts\python.exe run.py
 ```
 
-点击「全机扫描」即可开始自动发现并扫描本地磁盘，无需先选择文件夹；也可选择 Downloads、照片导出文件夹等个人目录进行局部扫描。双击或空格切换重复文件的选择，点击「检查所选并清理…」。取消或关闭确认窗口不会清理。扫描可以随时取消，未完成结果不能执行清理。
+1. 选择「全机扫描」或「扫描文件夹…」。
+2. 点击文件旁边的方框，或用「全选这些组的副本」勾选当前筛选结果的所有页。每组至少保留一份。要换保留的文件，先取消勾选另一份。
+3. 点击「一键清理…」，核对哪些路径保留、哪些移入回收站，再明确确认。清理记录会自动保存在本机，结果窗口会显示位置。
 
 ### 已知边界
 
-1. **内容相同仍可能各有用途**，例如不同目录中的附件和备份；必须自己判断路径用途。程序不会承诺“绝不误删”。
+1. **内容相同仍可能各有用途**，例如不同目录中的附件和备份。打开文件检查只覆盖当前操作系统能观察到的使用，无法推断休眠应用、未来任务或外部配置是否引用该路径。用途须由用户确认。
 2. 回收站内的文件仍占磁盘；本程序不会自动腾空回收站。逻辑大小不等于实际可回收大小，APFS 克隆、压缩、稀疏文件尤其如此。
 3. 全机扫描会读取大量文件，耗时和内存取决于文件数量，可随时取消。它不绕过保护或权限，并非每个字节均覆盖；权限拒绝会显示问题，保护目录整棵跳过。开发项目根据常见根标记识别，不能识别所有工程。
 4. 操作系统没有为跨平台 Trash 提供原子“验证并移动”接口。停止其他程序写入/同步所选路径；仍存在最后复核与移动之间的竞争窗口，不适合攻击者可修改的共享目录。
@@ -60,20 +76,32 @@ python -m unittest discover -s tests -v
 python tests/gui_smoke.py
 python -m pip install --cache-dir .cache/pip -e ".[build]"
 python build.py
+python verify_build_isolation.py
+python package.py
+python verify_bundle.py
 ```
 
-PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-15`), Intel (`macos-15-intel`) and Windows x64 (`windows-latest`), then uploads native artifacts. The workflow is not evidence of successful validation until its run is green. Download the platform ZIP from Releases, extract it, and run `ClearGuard.app` or `ClearGuard/ClearGuard.exe`; do not move the executable away from its companion files.
+PyInstaller must run on each target OS. GitHub Actions tests and builds on macOS Apple Silicon (`macos-15`), Intel (`macos-15-intel`) and Windows x64 (`windows-latest`), without publishing releases or downloadable artifacts. The workflow is not evidence of successful validation until its run is green. When the user has approved a future release, extract the platform ZIP and run `ClearGuard.app` or `ClearGuard/ClearGuard.exe`; do not move the executable away from its companion files.
 
 All configurable caches, virtual environments, build products and disposable fixtures stay inside the project. Safety tests use a fake trash backend and disposable fixtures; they never touch personal files or the real Trash. The GUI smoke test opens the actual native Tk UI and confirms empty default selection, the review dialog, and the Whole-computer Scan button/worker flow using a mocked scan result, without scanning real disks or executing cleanup.
 
 ### Safety model
 
-`core.scan` produces immutable file snapshots. `make_plan` accepts only duplicate paths from that scan and rejects selecting every member. `execute` requires a plan-bound explicit-consent token with a ten-minute expiry; this is an in-process guard, not authentication against hostile Python code. All selected files and keepers pass preflight before any move. An exclusive new JSONL audit file must be writable first; each move has a flushed and fsynced intent and result. Failure stops the remaining batch. Native Trash failure has no deletion fallback.
+`core.scan` produces immutable file snapshots. `make_plan` accepts only content-verified duplicate paths and requires an unselected keeper for each affected group. `execute` requires a plan-bound explicit-consent token with a ten-minute expiry; this is an in-process guard, not authentication against hostile Python code. All selected files and keepers pass preflight before any move. The preview lists detected open files, files with side data, and stale files separately. Execution rechecks every approved file before moving it. An exclusive new JSONL audit file must be writable first; each move has a flushed and fsynced intent and result. Failure stops the remaining batch. Native Trash failure has no deletion fallback.
 
-Scope for later releases: per-folder exclusions, configurable large/old thresholds, English UI, disk visualization, signed installers, accessibility testing and broader filesystem validation. Automated “unused file” removal is deliberately outside this preview's scope.
+Useful contributions include benchmarks on different storage devices, native Windows filesystem testing, and accessibility feedback. Please use generated files and share aggregate measurements without personal paths.
 
 Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md). Security: see [SECURITY.md](SECURITY.md).
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+## 本地构建与验收
+
+构建写入全新的 `local-builds/<独立编号>/`，不覆盖已经启动的应用。`work/latest-build.json` 仅记录当前候选，不能代表用户已验收。`verify_build_isolation.py` 保持旧构建进程运行，再构建另一份，核对旧程序未变化，并让旧进程继续加载依赖、执行测试扫描。
+
+`verify_bundle.py` 检查压缩包 CRC、解压到项目内独立 QA 目录，然后运行实际打包应用的磁盘依赖加载、文件夹扫描、跨目录扫描、确认保护、取消和测试文件清理/恢复流程。磁盘发现读取本机挂载元数据；文件扫描只针对自动创建的测试文件。清理使用测试目录内的移动适配器，不操作用户回收站。未覆盖的真实磁盘/权限/回收站组合不能被宣称全部验证。
+
+本仓库提供可自行运行和构建的源码。内部构建元数据 `0.0.0.dev0` 用于开发测试。

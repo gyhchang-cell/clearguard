@@ -1,6 +1,7 @@
-name: Desktop verification and builds
+name: Development checks (no publishing)
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -24,26 +25,6 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python tests/gui_smoke.py
       - run: python build.py
-      - run: python verify_bundle.py
+      - run: python verify_build_isolation.py
       - run: python package.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ClearGuard-${{ matrix.os }}
-          path: dist/*.zip
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: desktop
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-          merge-multiple: true
-      - name: Publish preview with verified platform packages
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" release-assets/*.zip --verify-tag --title "ClearGuard $RELEASE_TAG · Preview" --prerelease --notes-file docs/RELEASE_NOTES.md
+      - run: python verify_bundle.py

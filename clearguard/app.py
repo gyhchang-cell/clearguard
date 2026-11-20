@@ -1,31 +1,48 @@
 """Native desktop UI. All filesystem work runs outside the Tk main thread."""
 from __future__ import annotations
 import json
+import os
+import sys
 import queue
-import shutil
 import threading
 import tkinter as tk
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .core import scan, scan_computer, make_plan, execute
+from .presentation import (
+    ACCENT, BACKGROUND, PANEL, SELECTION, SURFACE, TEXT, configure_theme,
+)
+
+from .core import (
+    Progress, cleanup_candidates, execute, make_plan, scan, scan_computer,
+)
 
 
 def human(value):
-    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
-        if value < 1024:
-            return f'{value:,.1f} {unit}'
-        value /= 1024
-    return f'{value:.1f} PiB'
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if value < 1000:
+            return f'{value:,.0f} {unit}' if unit == 'B' else f'{value:,.1f} {unit}'
+        value /= 1000
+    return f'{value:,.1f} PB'
+
+
+def audit_directory():
+    if sys.platform == 'darwin':
+        return Path.home() / 'Library' / 'Logs' / 'ClearGuard'
+    if sys.platform == 'win32':
+        return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'ClearGuard' / 'Logs'
+    return Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'clearguard' / 'logs'
+
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title('ClearGuard · 空间有数，清理有据')
-        self.root.geometry('1120x760')
-        self.root.minsize(1000, 580)
+        self.root.title('ClearGuard')
+        self.root.geometry('1080x670')
+        self.root.minsize(830, 500)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.events = queue.Queue()
         self.cancel = threading.Event()
@@ -34,73 +51,158 @@ class App:
         self.cleaning = False
         self.chosen = set()
         self.rows = {}
+        self.eligible = {}
+        self.path_groups = {}
+        self.selected_counts = Counter()
+        self.all_checked = tk.BooleanVar(value=False)
+        self.page = 0
         self.folder = tk.StringVar()
-        self.status = tk.StringVar(value='选择文件夹，或点击全机扫描。扫描只读，不会自动清理。')
-        self.stats = tk.StringVar(value='所有文件保留原位 · 无上传 · 无后台自动清理')
-        style = ttk.Style()
-        style.configure('Title.TLabel', font=('Helvetica', 26, 'bold'))
-        style.configure('Sub.TLabel', font=('Helvetica', 12))
-        outer = ttk.Frame(root, padding=24)
+        self.scope = tk.StringVar(value='尚未扫描')
+        self.status = tk.StringVar()
+        self.stats = tk.StringVar()
+        self.query = tk.StringVar()
+        self.filtered_groups = []
+        self.deferred_groups = {}
+        self.review_page = 0
+        self.search_timer = None
+        self.summary = tk.StringVar()
+        self.size_summary = tk.StringVar()
+        self.cleanup_hint = tk.StringVar()
+        configure_theme(root)
+        outer = ttk.Frame(root, padding=(20, 16))
         outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='ClearGuard', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(outer, text='先看证据，再决定清理。', style='Sub.TLabel').pack(anchor='w', pady=(4, 18))
-        bar = ttk.Frame(outer)
-        bar.pack(fill='x')
-        self.entry = ttk.Entry(bar, textvariable=self.folder)
-        self.entry.pack(side='left', fill='x', expand=True)
-        self.pick = ttk.Button(bar, text='选择文件夹', command=self.choose)
-        self.pick.pack(side='left', padx=8)
-        self.start = ttk.Button(bar, text='开始扫描', command=self.begin)
-        self.start.pack(side='left')
-        self.computer = ttk.Button(bar, text='全机扫描', command=lambda: self.begin(whole_machine=True))
-        self.computer.pack(side='left', padx=(8, 0))
-        self.stop = ttk.Button(bar, text='取消扫描', command=self.cancel.set, state='disabled')
-        self.stop.pack(side='left', padx=(8, 0))
-        ttk.Label(outer, textvariable=self.stats, wraplength=1000).pack(anchor='w', pady=16)
-        notebook = ttk.Notebook(outer)
+        toolbar = ttk.Frame(outer)
+        toolbar.pack(fill='x')
+        ttk.Label(toolbar, text='ClearGuard', style='Title.TLabel').pack(side='left')
+        self.stop = ttk.Button(toolbar, text='取消扫描', command=self.cancel_scan, state='disabled')
+        self.stop.pack(side='right')
+        self.start = ttk.Button(toolbar, text='扫描文件夹…', command=self.choose)
+        self.start.pack(side='right', padx=(0, 8))
+        self.computer = ttk.Button(toolbar, text='全机扫描', style='Primary.TButton',
+                                   command=lambda: self.begin(whole_machine=True))
+        self.computer.pack(side='right', padx=(0, 8))
+        scan_status = ttk.Frame(outer)
+        scan_status.pack(fill='x', pady=(12, 6))
+        ttk.Label(scan_status, textvariable=self.scope, style='Muted.TLabel').pack(side='left')
+        ttk.Label(scan_status, textvariable=self.status, style='Muted.TLabel').pack(side='right')
+        self.progress = ttk.Progressbar(outer, mode='determinate', maximum=100,
+                                       style='Scan.Horizontal.TProgressbar')
+        self.progress.pack(fill='x')
+        summary = ttk.Frame(outer)
+        summary.pack(fill='x', pady=(9, 8))
+        self.summary_label = ttk.Label(summary, textvariable=self.summary, style='Summary.TLabel')
+        self.size_label = ttk.Label(summary, textvariable=self.size_summary, style='Muted.TLabel')
+        notebook = self.notebook = ttk.Notebook(outer)
         notebook.pack(fill='both', expand=True)
-        dup = ttk.Frame(notebook, padding=8)
-        review = ttk.Frame(notebook, padding=8)
-        details = ttk.Frame(notebook, padding=8)
-        notebook.add(dup, text='重复文件 · 可核验清理')
-        notebook.add(review, text='大文件 / 较旧文件 · 仅供查看')
-        notebook.add(details, text='规则与扫描问题')
-        ttk.Label(dup, text='双击文件切换选择。每组第一份固定保留；其余文件均默认不选。').pack(anchor='w', pady=(0, 8))
-        self.tree = self.table(dup, ('choice', 'size', 'path'), ('选择', '逻辑大小', '完整路径'))
+        dup = ttk.Frame(notebook, padding=(5, 8))
+        review = ttk.Frame(notebook, padding=(5, 8))
+        details = ttk.Frame(notebook, padding=(5, 8))
+        notebook.add(dup, text='内容相同的文件')
+        notebook.add(review, text='大文件与旧文件')
+        notebook.add(details, text='扫描范围与跳过项')
+        filters = ttk.Frame(dup)
+        filters.pack(fill='x', pady=(0, 7))
+        ttk.Label(filters, text='按文件名或路径筛选', style='Muted.TLabel').pack(side='left', padx=(2, 8))
+        self.search = ttk.Entry(filters, textvariable=self.query, width=33)
+        self.search.pack(side='left')
+        self.search.bind('<Escape>', lambda _: self.query.set(''))
+        ttk.Label(filters, textvariable=self.stats, style='Muted.TLabel').pack(side='right')
+        self.select_all = ttk.Checkbutton(filters, text='全选这些组的副本', variable=self.all_checked,
+                                          command=self.toggle_all, state='disabled')
+        self.select_all.pack(side='left', padx=(14, 0))
+        self.query.trace_add('write', self.schedule_filter)
+        self.tree = self.table(dup, ('choice', 'size', 'path'), ('清理状态', '大小', '文件位置'))
         self.tree.column('#0', width=190)
-        self.tree.column('choice', width=100, stretch=False)
-        self.tree.column('size', width=110, stretch=False)
-        self.tree.column('path', width=560)
-        self.tree.bind('<Double-1>', self.toggle)
+        self.tree.column('choice', width=174, stretch=False)
+        self.tree.column('size', width=110, stretch=False, anchor='e')
+        self.tree.column('path', width=580, minwidth=180)
+        self.tree.tag_configure('group', background=SURFACE, foreground=TEXT)
+        self.tree.tag_configure('eligible', foreground=ACCENT)
+        self.tree.bind('<Button-1>', self.click_choice)
         self.tree.bind('<space>', self.toggle)
-        ttk.Label(review, text='大于 100 MiB 或修改时间超过 180 天不代表无用；本页不提供删除。').pack(anchor='w', pady=(0, 8))
-        self.review = self.table(review, ('size', 'path'), ('逻辑大小', '完整路径'))
+        self.tree.bind('<<TreeviewOpen>>', self.expand_group)
+        pager = ttk.Frame(dup)
+        pager.pack(side='bottom', before=self.tree.master, fill='x', pady=(6, 0))
+        self.page_label = tk.StringVar()
+        self.next_page = ttk.Button(pager, text='下一页', command=lambda: self.change_page(1), state='disabled')
+        self.next_page.pack(side='right')
+        ttk.Label(pager, textvariable=self.page_label).pack(side='right', padx=8)
+        self.prev_page = ttk.Button(pager, text='上一页', command=lambda: self.change_page(-1), state='disabled')
+        self.prev_page.pack(side='right')
+        ttk.Label(review, text='列出较大或较久未修改的文件，方便查看。此页不能勾选清理。',
+                  style='Muted.TLabel').pack(anchor='w', pady=(0, 7))
+        self.review = self.table(review, ('size', 'path'), ('大小', '路径'))
         self.review.column('#0', width=160)
         self.review.column('size', width=110, stretch=False)
         self.review.column('path', width=650)
-        self.notes = tk.Text(details, wrap='word', height=12)
+        review_pager = ttk.Frame(review)
+        review_pager.pack(side='bottom', before=self.review.master, fill='x', pady=(6, 0))
+        self.review_next = ttk.Button(review_pager, text='下一页', command=lambda: self.change_review(1), state='disabled')
+        self.review_next.pack(side='right')
+        self.review_counter = ttk.Label(review_pager, text='', style='Muted.TLabel')
+        self.review_counter.pack(side='right', padx=8)
+        self.review_prev = ttk.Button(review_pager, text='上一页', command=lambda: self.change_review(-1), state='disabled')
+        self.review_prev.pack(side='right')
+        self.review_tab = review
+        self.notebook.bind('<<NotebookTabChanged>>', self.tab_changed)
+        self.notes = tk.Text(details, wrap='word', height=12, padx=12, pady=10,
+                             bg=PANEL, fg=TEXT, insertbackground=ACCENT,
+                             selectbackground=SELECTION, relief='flat', highlightthickness=0)
         self.notes.pack(fill='both', expand=True)
         self.write_notes('')
         footer = ttk.Frame(outer)
-        footer.pack(fill='x', pady=(14, 0))
-        self.export = ttk.Button(footer, text='导出本地报告', command=self.save_report, state='disabled')
+        footer.pack(side='bottom', before=notebook, fill='x', pady=(12, 0))
+        self.hint_label = ttk.Label(footer, textvariable=self.cleanup_hint, style='Muted.TLabel')
+        controls = self.cleanup_controls = ttk.Frame(footer)
+        controls.pack(fill='x')
+        self.export = ttk.Button(controls, text='保存扫描报告…', command=self.save_report, state='disabled')
         self.export.pack(side='left')
-        self.clear = ttk.Button(footer, text='检查所选并清理…', command=self.confirm, state='disabled')
+        self.clear = ttk.Button(controls, text='一键清理…', style='Primary.TButton',
+                                command=self.confirm, state='disabled')
         self.clear.pack(side='right')
-        self.selection_label = ttk.Label(footer, text='已选 0 个文件')
+        self.selection_label = ttk.Label(controls, text='')
         self.selection_label.pack(side='right', padx=16)
-        self.progress = ttk.Progressbar(outer, mode='indeterminate')
-        self.progress.pack(fill='x', pady=(14, 5))
-        ttk.Label(outer, textvariable=self.status, wraplength=1000).pack(anchor='w')
+        root.bind('<Command-f>' if root.tk.call('tk', 'windowingsystem') == 'aqua' else '<Control-f>',
+                  lambda _: self.search.focus_set())
         self.root.after(80, self.poll)
+
+    def cancel_scan(self):
+        self.cancel.set()
+        self.status.set('正在取消…')
+        self.stop.configure(state='disabled')
+
+    def schedule_filter(self, *_):
+        if self.search_timer is not None:
+            self.root.after_cancel(self.search_timer)
+        self.search_timer = self.root.after(130, self.apply_filter)
+
+    def apply_filter(self, reset_page=True):
+        if self.search_timer is not None:
+            self.root.after_cancel(self.search_timer)
+            self.search_timer = None
+        if not self.result:
+            return
+        terms = self.query.get().strip().casefold().split()
+        groups = self.result.groups
+        self.filtered_groups = (
+            [group for group in groups
+             if any(all(term in path for term in terms)
+                    for path in (str(item.path).casefold() for item in group.files))]
+            if terms else groups
+        )
+        self.stats.set(f'找到 {len(self.filtered_groups):,} 组' if terms else '')
+        if reset_page:
+            self.page = 0
+        self.render_groups()
+        self.update_bulk_control()
 
     def table(self, parent, columns, headings):
         frame = ttk.Frame(parent)
         frame.pack(fill='both', expand=True)
-        tree = ttk.Treeview(frame, columns=columns, show='tree headings', selectmode='browse')
-        tree.heading('#0', text='分组 / 文件')
+        tree = ttk.Treeview(frame, columns=columns, show='tree headings', selectmode='browse', style='Results.Treeview')
+        tree.heading('#0', text='文件名', anchor='w')
         for c, title in zip(columns, headings):
-            tree.heading(c, text=title)
+            tree.heading(c, text=title, anchor='e' if c == 'size' else 'w')
         scroll = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
         horizontal = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
         tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
@@ -115,37 +217,57 @@ class App:
         folder = filedialog.askdirectory(title='选择要扫描的个人文件夹')
         if folder:
             self.folder.set(folder)
+            self.begin()
+
+    def click_choice(self, event):
+        if self.tree.identify_column(event.x) == '#1':
+            row = self.tree.identify_row(event.y)
+            if row in self.rows:
+                self.tree.selection_set(row)
+                self.toggle()
+                return 'break'
+        return None
 
     def lock(self, busy, cleaning=False):
         self.busy, self.cleaning = busy, cleaning
-        for control in (self.start, self.computer, self.pick, self.entry):
+        for control in (self.start, self.computer, self.search):
             control.configure(state='disabled' if busy else 'normal')
         self.stop.configure(state='normal' if busy and not cleaning else 'disabled')
         self.export.configure(state='normal' if self.result and not busy else 'disabled')
         self.clear.configure(state='normal' if self.chosen and not busy else 'disabled')
+        self.update_bulk_control()
         if busy:
-            self.progress.start(12)
-        else:
-            self.progress.stop()
+            self.progress.configure(mode='determinate', value=0)
 
     def begin(self, whole_machine=False):
         if self.busy:
             return
         if not whole_machine and not self.folder.get().strip():
-            self.choose()
-            if not self.folder.get():
-                return
+            return self.choose()
         self.result = None
+        self.eligible.clear()
+        self.path_groups.clear()
+        self.selected_counts.clear()
+        self.page = 0
+        self.reset_pager()
+        self.stats.set('')
+        self.query.set('')
+        self.filtered_groups = []
+        self.deferred_groups.clear()
+        self.review_page = 0
+        self.change_review(0)
+        self.clear_summary()
         self.chosen.clear()
         self.rows.clear()
         self.tree.delete(*self.tree.get_children())
         self.review.delete(*self.review.get_children())
         self.update_selection()
         self.cancel.clear()
-        self.latest_progress = None
+        self.latest_progress = self.displayed_progress = None
         self.lock(True)
         self.status.set('正在发现本地磁盘…' if whole_machine else '正在扫描…')
         folder = Path(self.folder.get()).expanduser()
+        self.scope.set('全机扫描' if whole_machine else folder.name)
         def work():
             try:
                 result = (scan_computer(self.cancel, self.report_progress) if whole_machine
@@ -160,58 +282,182 @@ class App:
         self.latest_progress = text
 
     def poll(self):
-        if self.busy and not self.cleaning and getattr(self, 'latest_progress', None):
-            self.status.set(self.latest_progress)
-            self.latest_progress = None
+        event = getattr(self, 'latest_progress', None)
+        if self.busy and not self.cleaning and not self.cancel.is_set() and event is not None and event is not getattr(self, 'displayed_progress', None):
+            self.displayed_progress = event
+            if isinstance(event, Progress):
+                value = 100 * event.completed / event.total if event.total else 0
+                self.progress.configure(value=value)
+                if event.phase == 'discover':
+                    label = f'已发现 {event.completed:,} 个文件' if event.completed else '正在扫描目录'
+                elif event.read_bytes is not None:
+                    label = f'{event} · {int(value)}% · 已读 {human(event.read_bytes)}'
+                elif event.phase == 'done':
+                    label = '扫描完成'
+                elif event.total:
+                    phase = '筛选候选' if event.phase == 'sample' else '逐字节复核'
+                    label = f'{phase} · {event.completed:,}/{event.total:,}'
+                else:
+                    label = str(event)
+                self.status.set(label)
+            else:
+                self.status.set(str(event))
         try:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == 'scan':
+                    self.latest_progress = None
                     self.result = payload
                     self.populate()
                     self.lock(False)
+                    self.progress.configure(value=0 if payload.cancelled else 100)
+                elif kind == 'plan':
+                    self.lock(False)
+                    self.progress.configure(value=100)
+                    self.status.set('扫描完成')
+                    self.show_plan(payload)
                 elif kind == 'error':
                     self.lock(False)
                     self.status.set('操作未完成：' + payload)
                     messagebox.showerror('操作停止', payload)
                 elif kind == 'clean':
+                    payload, audit_path = payload
                     success = sum(x['status'] == 'trashed' for x in payload)
                     self.status.set(f'已送入系统废纸篓/回收站：{success} 个。扫描结果已失效，请重新扫描。')
                     self.result = None
                     self.chosen.clear()
                     self.rows.clear()
+                    self.eligible.clear()
+                    self.path_groups.clear()
+                    self.selected_counts.clear()
+                    self.reset_pager()
+                    self.change_review(0)
+                    self.deferred_groups.clear()
+                    self.filtered_groups = []
+                    self.clear_summary()
+                    self.progress.configure(value=0)
                     self.tree.delete(*self.tree.get_children())
                     self.review.delete(*self.review.get_children())
                     self.update_selection()
                     self.lock(False)
                     failures = [x.get('error', '') for x in payload if x['status'] == 'failed']
-                    messagebox.showinfo('清理结果', f'已送入回收站 {success} 个文件。\n可通过系统回收站恢复。\n移动到回收站不会立即释放磁盘空间。' + ('\n失败后已停止：' + '\n'.join(failures) if failures else ''))
+                    messagebox.showinfo('清理结果', f'已送入回收站 {success} 个文件。\n可通过系统回收站恢复。\n移动到回收站不会立即释放磁盘空间。' + ('\n失败后已停止：' + '\n'.join(failures) if failures else '')
+                                        + f'\n\n清理记录：{audit_path}')
         except queue.Empty:
             pass
         self.root.after(80, self.poll)
 
+    GROUPS_PER_PAGE = 200
+
+    def reset_pager(self):
+        self.page_label.set('')
+        self.prev_page.configure(state='disabled')
+        self.next_page.configure(state='disabled')
+
+    def change_page(self, delta):
+        if self.busy or not self.result:
+            return
+        page_count = (len(self.filtered_groups) + self.GROUPS_PER_PAGE - 1) // self.GROUPS_PER_PAGE
+        if 0 <= self.page + delta < page_count:
+            self.page += delta
+            self.render_groups()
+
+    def render_groups(self):
+        groups = self.filtered_groups
+        self.deferred_groups.clear()
+        self.rows.clear()
+        self.tree.delete(*self.tree.get_children())
+        start = self.page * self.GROUPS_PER_PAGE
+        for group in groups[start:start + self.GROUPS_PER_PAGE]:
+            parent = self.tree.insert('', 'end', text=group.files[0].path.name,
+                                      values=(f'{len(group.files)} 份内容相同', f'每份 {human(group.files[0].size)}', ''),
+                                      tags=('group',), open=len(group.files) <= 6)
+            if len(group.files) > 6:
+                self.deferred_groups[parent] = group
+                self.tree.insert(parent, 'end')  # disclosure cue, replaced on open
+            else:
+                self.render_files(parent, group)
+        self.tree.yview_moveto(0)
+        if not groups:
+            self.reset_pager()
+            return
+        page_count = (len(groups) + self.GROUPS_PER_PAGE - 1) // self.GROUPS_PER_PAGE
+        self.page_label.set(f'第 {self.page + 1} 页／共 {page_count} 页' if page_count > 1 else '')
+        self.prev_page.configure(state='normal' if self.page else 'disabled')
+        self.next_page.configure(state='normal' if self.page + 1 < page_count else 'disabled')
+
+    def expand_group(self, _event):
+        parent = self.tree.focus()
+        group = self.deferred_groups.pop(parent, None)
+        if group is not None:
+            self.tree.delete(*self.tree.get_children(parent))
+            self.render_files(parent, group)
+
+    def render_files(self, parent, group):
+        for item in group.files:
+            choice = self.choice_label(item.path)
+            row = self.tree.insert(parent, 'end', text=item.path.name,
+                                   values=(choice, human(item.size), str(item.path)),
+                                   tags=('eligible',) if item.path in self.eligible else ())
+            if item.path in self.eligible:
+                self.rows[row] = item
+
+    REVIEW_PER_PAGE = 400
+
+    def tab_changed(self, _event):
+        if self.notebook.select() == str(self.review_tab):
+            self.change_review(0)
+
+    def change_review(self, delta):
+        files = self.result.review if self.result else ()
+        page_count = (len(files) + self.REVIEW_PER_PAGE - 1) // self.REVIEW_PER_PAGE
+        self.review_page = min(max(0, self.review_page + delta), max(0, page_count - 1))
+        self.review.delete(*self.review.get_children())
+        start = self.review_page * self.REVIEW_PER_PAGE
+        for item in files[start:start + self.REVIEW_PER_PAGE]:
+            self.review.insert('', 'end', text=item.path.name, values=(human(item.size), str(item.path)))
+        self.review.yview_moveto(0)
+        self.review_counter.configure(text=f'第 {self.review_page + 1} 页／共 {page_count} 页' if page_count > 1 else '')
+        self.review_prev.configure(state='normal' if self.review_page else 'disabled')
+        self.review_next.configure(state='normal' if self.review_page + 1 < page_count else 'disabled')
+
     def populate(self):
         r = self.result
-        try:
-            free = human(shutil.disk_usage(r.root).free)
-        except OSError:
-            free = '未知'
-        scope_label = f'全机扫描 · {len(r.roots)} 个候选位置 · ' if r.mode == 'computer' else ''
-        disk_label = '首个磁盘可用' if r.mode == 'computer' else '当前磁盘可用'
-        self.stats.set(scope_label + f'读取 {r.scanned:,} 个文件 · 重复组 {len(r.groups):,} · 可审查重复数据 {human(r.potential)} · {disk_label} {free}')
-        for i, group in enumerate(r.groups):
-            parent = self.tree.insert('', 'end', text=f'重复组 {i+1} · {len(group.files)} 份', open=True)
-            for j, item in enumerate(group.files):
-                row = self.tree.insert(parent, 'end', text=item.path.name,
-                                       values=('保留' if j == 0 else '□ 未选', human(item.size), str(item.path)))
-                if j:
-                    self.rows[row] = item
-        for item in r.review:
-            self.review.insert('', 'end', text=item.path.name, values=(human(item.size), str(item.path)))
-        self.write_notes('扫描范围：\n' + '\n'.join(str(p) for p in (r.roots or (r.root,))) +
-                         f'\n\n跳过受保护条目/目录：{r.skipped}\n未扫描位置：\n' + '\n'.join(r.excluded) +
-                         f'\n\n扫描问题：{len(r.errors)}\n' + '\n'.join(r.errors))
-        self.status.set('扫描已取消，结果不可用于清理。' if r.cancelled else '所列范围扫描结束，保护/无权限位置未扫描，详见规则与扫描问题。')
+        self.eligible = cleanup_candidates(r)
+        self.path_groups = {item.path: group for group in r.groups for item in group.files}
+        self.apply_filter(reset_page=False)
+        self.review.delete(*self.review.get_children())
+        self.summary.set(f'已检查 {r.scanned:,} 个文件' if r.cancelled else
+                         f'已检查 {r.scanned:,} 个文件，找到 {len(r.groups):,} 组内容相同的文件')
+        self.summary_label.pack(anchor='w')
+        if r.groups:
+            self.size_summary.set(f'每组留一份，其余副本合计 {human(r.potential)}。实际可释放空间可能更少。')
+            self.size_label.pack(anchor='w', pady=(3, 0))
+        else:
+            self.size_label.pack_forget()
+        if self.notebook.select() == str(self.review_tab):
+            self.change_review(0)
+        details = ['开始扫描的位置', *(str(p) for p in (r.roots or (r.root,))), '',
+                   f'因保护规则跳过 {r.skipped:,} 个文件或文件夹', *r.excluded, '',
+                   f'扫描遇到 {len(r.errors):,} 个问题', *r.errors]
+        self.write_notes('\n'.join(details))
+        self.status.set('已取消，不能用本次结果清理' if r.cancelled else
+                        ('扫描完成，有未能检查的项目' if r.errors else '扫描完成'))
+        self.update_selection()
+
+    def clear_summary(self):
+        self.summary.set('')
+        self.size_summary.set('')
+        self.summary_label.pack_forget()
+        self.size_label.pack_forget()
+
+    def choice_label(self, path):
+        if path in self.chosen:
+            return '☑ 已勾选'
+        group = self.path_groups[path]
+        if self.selected_counts[group.id] == len(group.files) - 1:
+            return '保留这份'
+        return '□ 可勾选'
 
     def toggle(self, event=None):
         if self.busy:
@@ -221,80 +467,142 @@ class App:
             return
         row = selection[0]
         item = self.rows.get(row)
-        if item:
-            if item.path in self.chosen:
-                self.chosen.remove(item.path)
+        if item is None:
+            return
+        group = self.path_groups[item.path]
+        if item.path in self.chosen:
+            self.chosen.remove(item.path)
+            self.selected_counts[group.id] -= 1
+        elif self.selected_counts[group.id] < len(group.files) - 1:
+            self.chosen.add(item.path)
+            self.selected_counts[group.id] += 1
+        for sibling in self.tree.get_children(self.tree.parent(row)):
+            if sibling in self.rows:
+                self.tree.set(sibling, 'choice', self.choice_label(self.rows[sibling].path))
+        self.update_selection()
+
+    def update_bulk_control(self):
+        groups = self.filtered_groups
+        all_selected = bool(groups) and all(
+            self.selected_counts[g.id] == len(g.files) - 1 for g in groups)
+        self.all_checked.set(all_selected)
+        self.select_all.configure(state='normal' if groups and not self.busy else 'disabled')
+        partial = not all_selected and any(self.selected_counts[g.id] for g in groups)
+        self.select_all.state(['alternate'] if partial else ['!alternate'])
+
+    def toggle_all(self):
+        if self.busy:
+            return
+        select = self.all_checked.get()
+        if self.search_timer is not None:
+            self.apply_filter()
+            select = not self.all_checked.get()
+        if not self.filtered_groups:
+            return
+        for group in self.filtered_groups:
+            remaining = [item.path for item in group.files if item.path not in self.chosen]
+            if select:
+                # Preserve one already unselected file and any manual choices.
+                self.chosen.update(remaining[1:])
+                self.selected_counts[group.id] = len(group.files) - 1
             else:
-                self.chosen.add(item.path)
-            self.tree.set(row, 'choice', '☑ 已选' if item.path in self.chosen else '□ 未选')
+                self.chosen.difference_update(item.path for item in group.files)
+                self.selected_counts.pop(group.id, None)
+        for row, item in self.rows.items():
+            self.tree.set(row, 'choice', self.choice_label(item.path))
         self.update_selection()
 
     def update_selection(self):
-        size = sum(f.size for f in self.rows.values() if f.path in self.chosen)
-        self.selection_label.configure(text=f'已选 {len(self.chosen)} 个 · {human(size)}')
+        size = sum(self.eligible[path].size for path in self.chosen)
+        self.selection_label.configure(text=f'已选 {len(self.chosen)} 个 · {human(size)}' if self.chosen else '')
         self.clear.configure(state='normal' if self.chosen and not self.busy else 'disabled')
+        self.update_bulk_control()
+        if not self.result or self.result.cancelled or not self.result.groups:
+            hint = ''
+        elif self.chosen:
+            hint = '点「一键清理」查看清单。确认后才会移入回收站。'
+        else:
+            hint = '点文件旁的方框即可勾选。全选涵盖筛选结果的所有页，每组留一份。'
+        self.cleanup_hint.set(hint)
+        if hint:
+            self.hint_label.pack(before=self.cleanup_controls, anchor='w', pady=(0, 6))
+        else:
+            self.hint_label.pack_forget()
 
     def write_notes(self, extra):
-        text = ('核验：文件大小 → 完整 SHA-256 → 逐字节比较 → 清理前再次验证。\n'
-                '保护：系统目录、开发项目、应用包、已知云同步目录、占位文件、符号链接、硬链接。\n'
-                '不根据名称、日期、扩展名或 AI 推断“无用”。不清空回收站，不永久删除。\n'
-                '全机扫描：本机已挂载磁盘，含已挂载 USB；不进入网络盘、虚拟卷和系统内部卷。\n'
-                '保护目录、拒绝访问、离线磁盘与未挂载位置不在实际覆盖范围内。\n'
-                '数字为逻辑大小；APFS 克隆、压缩、稀疏文件和回收站使实际可释放空间不同。\n'
-                '请在清理前停止同步/写入相关文件；程序无法原子锁住外部程序对路径的全部修改。\n'
-                '运行内存由操作系统管理，本应用不终止进程，不提供“内存加速”。\n\n' + extra)
         self.notes.configure(state='normal')
         self.notes.delete('1.0', 'end')
-        self.notes.insert('1.0', text)
+        self.notes.insert('1.0', extra)
         self.notes.configure(state='disabled')
 
     def confirm(self):
-        try:
-            plan = make_plan(self.result, list(self.chosen))
-        except ValueError as error:
-            messagebox.showerror('无法建立清理计划', str(error))
+        if self.busy or not self.chosen or self.result is None:
             return
+        result, selected = self.result, list(self.chosen)
+        self.lock(True, cleaning=True)
+        self.status.set('正在核对已勾选的文件…')
+
+        def work():
+            try:
+                self.events.put(('plan', make_plan(result, selected, skip_blocked=True)))
+            except Exception as error:
+                self.events.put(('error', str(error)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_plan(self, plan):
         dialog = tk.Toplevel(self.root)
-        dialog.title('确认本次清理')
+        dialog.title('查看清理清单')
+        dialog.configure(bg=BACKGROUND)
         dialog.geometry('820x520')
         dialog.transient(self.root)
         dialog.grab_set()
-        ttk.Label(dialog, text=f'将 {len(plan.targets)} 个文件（{human(plan.bytes)}）移入系统回收站', font=('Helvetica', 16, 'bold'), wraplength=770).pack(padx=20, pady=16)
-        text = tk.Text(dialog, wrap='word')
-        text.pack(fill='both', expand=True, padx=20)
-        for g in plan.groups:
-            text.insert('end', '\n保留：\n' + '\n'.join(str(f.path) for f in g.files if f.path not in self.chosen) + '\n')
-            text.insert('end', '移入回收站：\n' + '\n'.join(str(f.path) for f in g.files if f.path in self.chosen) + '\nSHA-256: ' + g.sha256 + '\n')
+        count = len(plan.targets)
+        title = f'{count:,} 个文件待移入回收站 · {human(plan.bytes)}' if count else '没有可移动的文件'
+        if plan.blocked:
+            title += f' · 保留 {len(plan.blocked):,} 个异常项'
+        ttk.Label(dialog, text=title, font=('TkDefaultFont', 15, 'bold'), wraplength=740).pack(padx=20, pady=16)
+        frame = ttk.Frame(dialog)
+        frame.pack(fill='both', expand=True, padx=20)
+        text = tk.Text(frame, wrap='word', bg=PANEL, fg=TEXT, padx=12, pady=8,
+                       insertbackground=ACCENT, selectbackground=SELECTION, relief='flat')
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=text.yview)
+        scroll.pack(side='right', fill='y')
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side='left', fill='both', expand=True)
+        targets = {f.path for f in plan.targets}
+        sections = []
+        if plan.blocked:
+            sections.extend(['会保留的异常项', *(f'{path}\n  {reason}' for path, reason in plan.blocked), ''])
+        for group in plan.groups:
+            sections.extend(['保留', *(str(f.path) for f in group.files if f.path not in targets),
+                             '移入回收站', *(str(f.path) for f in group.files if f.path in targets), ''])
+        text.insert('1.0', '\n'.join(sections))
         text.configure(state='disabled')
         consent = tk.BooleanVar(value=False)
         button = ttk.Button(dialog, text='确认移入回收站', state='disabled')
-        ttk.Checkbutton(dialog, text='我已核对完整路径与保留副本，并同意本次清理。', variable=consent,
-                        command=lambda: button.configure(state='normal' if consent.get() else 'disabled')).pack(pady=12)
-        ttk.Label(dialog, text='可在系统回收站恢复；本操作不会立即释放磁盘空间。').pack()
+        if count:
+            ttk.Checkbutton(dialog, text='我已核对文件位置，确认勾选的是不再需要的副本。', variable=consent,
+                            command=lambda: button.configure(state='normal' if consent.get() else 'disabled')).pack(pady=12)
+            ttk.Label(dialog, text='文件可从回收站恢复。清理记录自动保存在本机。').pack()
         def approved():
-            if not consent.get():
+            if not count or not consent.get():
                 return
-            audit = filedialog.asksaveasfilename(parent=dialog, title='保存本次清理审计日志（仅保存在本机）',
-                                               initialdir=str(Path.home() if self.result.mode == 'computer' else self.result.root), initialfile='clearguard-audit.jsonl', defaultextension='.jsonl')
-            if not audit:
-                return
-            # Avoid writing an audit over any scanned file, including keepers.
-            audit_path = Path(audit).absolute()
-            if audit_path.exists() or any(audit_path == f.path for g in plan.groups for f in g.files):
-                messagebox.showerror('请选择新的日志文件', '审计日志不能覆盖现有文件。', parent=dialog)
-                return
+            audit_path = audit_directory() / f'clearguard-{plan.id}.jsonl'
             dialog.destroy()
             self.lock(True, cleaning=True)
             self.status.set('正在复核并移动所选文件，请勿关闭窗口…')
             def work():
                 try:
-                    self.events.put(('clean', execute(plan, f'TRASH {plan.id}', audit_path)))
+                    outcomes = execute(plan, f'TRASH {plan.id}', audit_path)
+                    self.events.put(('clean', (outcomes, audit_path)))
                 except Exception as error:
                     self.events.put(('error', str(error)))
             threading.Thread(target=work, daemon=True).start()
         button.configure(command=approved)
-        button.pack(side='right', padx=20, pady=14)
-        ttk.Button(dialog, text='取消', command=dialog.destroy).pack(side='right', pady=14)
+        if count:
+            button.pack(side='right', padx=20, pady=14)
+        ttk.Button(dialog, text='取消' if count else '关闭', command=dialog.destroy).pack(side='right', padx=14, pady=14)
 
     def save_report(self):
         if not self.result:

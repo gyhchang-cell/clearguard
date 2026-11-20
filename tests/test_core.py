@@ -17,6 +17,9 @@ class SafetyTests(unittest.TestCase):
         # markers only in tests, never in production. Test real policy below.
         self.markers = patch.object(core, 'PROJECT_MARKERS', {'PROTECTED_PROJECT'})
         self.markers.start()
+        workspaces = patch.object(core, 'MANAGED_WORKSPACES', ())
+        workspaces.start()
+        self.addCleanup(workspaces.stop)
     def tearDown(self):
         self.markers.stop()
         self.temp.cleanup()
@@ -26,12 +29,12 @@ class SafetyTests(unittest.TestCase):
         p.write_bytes(data)
         return p
     def setup_plan(self, third=False):
-        self.a, self.b = self.file('a'), self.file('b')
+        self.a, self.b = self.file('a'), self.file('discard/b')
         if third:
-            self.c = self.file('c')
+            self.c = self.file('discard/c')
         self.r = core.scan(self.root)
         self.assertTrue(self.r.groups, repr(self.r))
-        self.plan = core.make_plan(self.r, [self.b, self.c] if third else [self.b])
+        self.plan = core.make_plan(self.r, [self.b, self.c] if third else [self.b], self.b.parent)
         self.calls = []
     def execute(self, trash=None, audit=None, consent=None):
         return core.execute(self.plan, consent if consent is not None else f'TRASH {self.plan.id}',
@@ -49,7 +52,111 @@ class SafetyTests(unittest.TestCase):
     def test_no_selection_and_keep_one(self):
         self.setup_plan()
         for chosen in ([], [self.a, self.b], [self.root / 'unknown']):
-            with self.assertRaises(core.UnsafeFile): core.make_plan(self.r, chosen)
+            with self.assertRaises(core.UnsafeFile): core.make_plan(self.r, chosen, self.b.parent)
+    def test_direct_selection_can_choose_which_copy_to_keep(self):
+        self.setup_plan()
+        self.assertEqual(set(core.cleanup_candidates(self.r)), {self.a, self.b})
+        direct = core.make_plan(self.r, [self.a])
+        self.assertEqual([f.path for f in direct.targets], [self.a])
+        self.assertIsNone(direct.disposable_root)
+        with self.assertRaisesRegex(core.UnsafeFile, '至少保留'):
+            core.make_plan(self.r, [self.a, self.b])
+        with self.assertRaises(core.UnsafeFile):
+            core.make_plan(self.r, [self.b], self.root)
+
+    def test_bulk_preview_excludes_blocked_without_using_it_as_keeper(self):
+        self.setup_plan(third=True)
+        with self.c.open('rb'):
+            plan = core.make_plan(self.r, [self.b, self.c], skip_blocked=True)
+        self.assertEqual([f.path for f in plan.targets], [self.b])
+        self.assertEqual([path for path, _ in plan.blocked], [self.c])
+        self.assertEqual([f.path for f in plan.groups[0].files], [self.a, self.b])
+        audit = self.root / 'direct-audit.jsonl'
+        core.execute(plan, f'TRASH {plan.id}', audit, trash=self.calls.append)
+        self.assertEqual(self.calls, [str(self.b)])
+
+    def test_bulk_preview_protects_targets_when_unselected_keeper_disappears(self):
+        self.setup_plan(third=True)
+        self.a.unlink()
+        plan = core.make_plan(self.r, [self.b, self.c], skip_blocked=True)
+        self.assertFalse(plan.targets or plan.groups)
+        self.assertEqual({path for path, _ in plan.blocked}, {self.b, self.c})
+
+    def test_attached_data_blocks_plan_for_equal_content(self):
+        import subprocess
+        import sys
+        self.setup_plan()
+        if sys.platform == 'darwin':
+            subprocess.run(['/usr/bin/xattr', '-w', 'org.clearguard.qa', 'keep me', str(self.b)],
+                           check=True, capture_output=True)
+        elif sys.platform == 'win32':
+            import ctypes
+            if hasattr(ctypes.WinDLL('ntdll'), 'wine_get_version'):
+                self.skipTest('A real NTFS volume is required for the named stream integration test')
+            try:
+                Path(str(self.b) + ':clearguard-qa').write_bytes(b'keep me')
+            except OSError:
+                self.skipTest('Fixture volume does not support Windows named streams')
+        else:
+            self.skipTest('Requires a macOS or Windows metadata API')
+        self.assertTrue(core._has_side_data(self.b))
+        current = core.scan(self.root)
+        self.assertEqual(len(current.groups), 1)
+        with self.assertRaisesRegex(core.UnsafeFile, '附加文件数据'):
+            core.make_plan(current, [self.b], self.b.parent)
+        self.assertTrue(self.b.exists())
+        self.assertFalse(self.calls)
+
+    def test_windows_named_stream_is_detected_by_enumerator(self):
+        import sys
+        if sys.platform != 'win32':
+            self.skipTest('Requires Windows ctypes types')
+        self.setup_plan()
+        data_type, _, _, _ = core._windows_stream_api()
+        closed = []
+
+        def first(_path, _level, data, _flags):
+            data._obj.name = '::$DATA'
+            return 1
+
+        def next_stream(_handle, data):
+            data._obj.name = ':project-settings:$DATA'
+            return True
+
+        with patch.object(core, '_windows_stream_api',
+                          return_value=(data_type, first, next_stream, closed.append)):
+            self.assertTrue(core._has_side_data(self.b))
+        self.assertEqual(closed, [1])
+
+    def test_new_side_data_blocks_execution_before_any_move(self):
+        self.setup_plan(third=True)
+        with patch.object(core, '_has_side_data', side_effect=lambda path: path == self.c):
+            with self.assertRaisesRegex(core.UnsafeFile, '附加文件数据'):
+                self.execute()
+        self.assertFalse(self.calls)
+        self.assertTrue(self.b.exists() and self.c.exists())
+        self.assertFalse((self.root / 'audit').exists())
+
+    def test_detected_open_file_blocks_entire_plan(self):
+        self.setup_plan()
+        with self.b.open('rb'):
+            with self.assertRaisesRegex(core.UnsafeFile, '正在使用'):
+                self.execute()
+        self.assertFalse(self.calls)
+        self.assertTrue(self.b.exists())
+        self.assertFalse((self.root / 'audit').exists())
+
+    def test_codex_workspace_and_state_are_never_candidates(self):
+        self.file('Codex/active-content')
+        self.file('.codex/session')
+        self.file('outside')
+        with patch.object(core, 'MANAGED_WORKSPACES', (self.root / 'Codex',)):
+            result = core.scan(self.root)
+            self.assertEqual(result.scanned, 1)
+            self.assertFalse(result.groups)
+            with self.assertRaises(core.UnsafeFile):
+                core.disposable_scope(self.root / 'Codex')
+
     def test_no_consent_no_mutation(self):
         self.setup_plan()
         with self.assertRaises(core.UnsafeFile): self.execute(consent='yes')
@@ -163,9 +270,9 @@ class ComputerScanTests(unittest.TestCase):
 
     def test_fresh_file_snapshot_matches_open_handle(self):
         original_digest = core.digest
-        def measured(item, cancel=None):
+        def measured(item, cancel=None, **kwargs):
             try:
-                return original_digest(item, cancel)
+                return original_digest(item, cancel, **kwargs)
             except core.UnsafeFile as error:
                 with item.path.open('rb') as stream:
                     actual = os.fstat(stream.fileno())
@@ -189,7 +296,7 @@ class ComputerScanTests(unittest.TestCase):
         self.assertEqual(len(r.groups), 1)
         self.assertEqual(r.potential, 7)
         self.assertEqual(r.excluded, ['network: excluded'])
-        self.assertEqual(len(core.make_plan(r, [copy]).targets), 1)
+        self.assertEqual(len(core.make_plan(r, [copy], b).targets), 1)
 
     def test_nested_mount_scanned_separately_not_twice(self):
         self.file('outer/a'); self.file('outer/mount/b')

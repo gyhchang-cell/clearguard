@@ -8,3 +8,5 @@ work/
 .cache/
 *.spec
 .DS_Store
+
+local-builds/
