@@ -175,6 +175,15 @@ class SafetyTests(unittest.TestCase):
         self.setup_plan(); self.b.write_bytes(b'changed')
         with self.assertRaises(core.UnsafeFile): self.execute()
         self.assertFalse(self.calls)
+    def test_content_preflight_rejects_rewrite_even_if_metadata_matches(self):
+        self.setup_plan()
+        self.b.write_bytes(b'changed')  # Same byte count as the original.
+        with patch.object(core.Snapshot, 'verify'), patch.object(core.Snapshot, 'verify_handle'):
+            with self.assertRaisesRegex(core.UnsafeFile, '内容复核失败'):
+                self.execute()
+        self.assertFalse(self.calls)
+        self.assertFalse((self.root / 'audit').exists())
+
     def test_removed_keeper_aborts(self):
         self.setup_plan(); self.a.unlink()
         with self.assertRaises(OSError): self.execute()

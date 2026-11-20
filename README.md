@@ -20,6 +20,10 @@ ClearGuard 按实际内容查找重复文件。扫描后可以直接逐项勾选
 
 [首版更新说明和 SHA-256 校验文件](https://github.com/gyhchang-cell/clearguard/releases/tag/v0.0.1)。本版未做 Apple Developer ID 公证或 Windows Authenticode 签名。系统可能提示未识别开发者。
 
+![演示：检查重复组、勾选副本并核对回收站清单](docs/demo.gif)
+
+演示使用模拟文件。实际操作要由你确认保留的文件位置。
+
 ## 扫描算法
 
 1. **元数据分组。** 只把相同大小的普通文件放进候选组。按文件身份去重，保护链接、占位文件、系统目录和已知开发、应用与 Codex 数据目录。

@@ -1,4 +1,5 @@
 """Regression tests for rejection-only sampling and measured phase progress."""
+import os
 import tempfile
 import threading
 import unittest
@@ -77,6 +78,8 @@ class ScanProgressTests(unittest.TestCase):
         a = self.file('a',b'a'*200000)
         snap = core.Snapshot.read(a)
         a.write_bytes(b'b'*200000)
+        # Filesystems may coalesce consecutive writes into the same time tick.
+        os.utime(a, ns=(a.stat().st_atime_ns, snap.mtime_ns + 2_000_000_000))
         with self.assertRaises(core.UnsafeFile): core.sample(snap)
     def test_new_project_marker_before_content_read_blocks_duplicate(self):
         self.file('a',b'a'*200000); self.file('b',b'a'*200000)
