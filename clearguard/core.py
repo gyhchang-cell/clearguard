@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import stat
 import threading
 import time
@@ -17,7 +18,9 @@ BLOCKED_NAMES = {
     '.git', '.svn', '.hg', '.ssh', '.gnupg', '.aws', '.azure', '.config',
     '.trash', '.trashes', '$recycle.bin', 'system volume information',
     'windows', 'program files', 'program files (x86)', 'programdata',
-    'appdata', 'library', 'applications', 'system', 'node_modules',
+    '.spotlight-v100', '.fseventsd', '.documentrevisions-v100', '.temporaryitems',
+    'recovery', 'config.msi', 'pagefile.sys', 'swapfile.sys', 'hiberfil.sys',
+    'bootmgr', 'bootnxt', '$winreagent', '$windows.~bt', '$windows.~ws', 'appdata', 'library', 'applications', 'system', 'node_modules',
     '.venv', 'venv', '__pycache__', 'onedrive', 'dropbox',
 }
 PACKAGE_SUFFIXES = {'.app', '.bundle', '.framework', '.photoslibrary', '.photolibrary',
@@ -26,7 +29,7 @@ PROJECT_MARKERS = {'.git', 'pyproject.toml', 'package.json', 'Cargo.toml',
                    'pom.xml', 'build.gradle', 'build.gradle.kts', 'go.mod',
                    'CMakeLists.txt', 'settings.gradle', 'settings.gradle.kts'}
 SYSTEM_ROOTS = ('/System', '/Library', '/Applications', '/usr', '/bin', '/sbin',
-                '/etc', '/private', '/dev', '/proc', '/sys')
+                '/etc', '/private', '/dev', '/proc', '/sys', '/run', '/boot')
 
 
 class UnsafeFile(ValueError):
@@ -60,6 +63,54 @@ def assert_safe(path: Path):
     if os.name != 'nt' and any(path == Path(p) or Path(p) in path.parents for p in SYSTEM_ROOTS):
         raise UnsafeFile('系统目录受保护')
     return path
+
+
+@dataclass(frozen=True)
+class ComputerScope:
+    roots: tuple[Path, ...]
+    boundaries: tuple[Path, ...]
+    excluded: tuple[str, ...]
+
+
+def discover_computer_scope():
+    """Read mount metadata only; never connect to network shares or mount disks."""
+    import psutil
+    local_types = {'apfs', 'hfs', 'hfs+', 'ntfs', 'refs', 'exfat', 'msdos',
+                   'fat', 'fat32', 'vfat', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'zfs'}
+    partitions = psutil.disk_partitions(all=True)
+    boundaries = set()
+    roots = set()
+    excluded = []
+    if sys.platform == 'darwin':
+        # The visible /Users tree uses APFS firmlinks into the Data volume.
+        # Walking /System/Volumes/Data as well would count those files twice.
+        roots.add(Path('/'))
+    for disk in partitions:
+        path = Path(os.path.abspath(disk.mountpoint))
+        boundaries.add(path)
+        options = set(disk.opts.casefold().split(','))
+        if (disk.fstype.casefold() not in local_types or
+                options & {'remote', 'cdrom', 'unmounted', 'ramdisk'} or
+                disk.mountpoint.startswith('\\\\')):
+            excluded.append(f'{path}：网络、虚拟、光盘或不支持的文件系统，未扫描')
+            continue
+        if sys.platform == 'darwin' and path != Path('/'):
+            if path.parent != Path('/Volumes'):
+                excluded.append(f'{path}：系统内部卷或重复挂载，未单独扫描')
+                continue
+        roots.add(path)
+    if not roots:
+        raise UnsafeFile('未发现可扫描的本地磁盘，请使用文件夹扫描')
+    return ComputerScope(tuple(sorted(roots, key=str)), tuple(sorted(boundaries, key=str)), tuple(excluded))
+
+
+def scan_computer(cancel=None, progress=lambda _: None):
+    if cancel and cancel.is_set():
+        return ScanResult(Path.home(), cancelled=True, mode='computer')
+    progress('正在发现本地磁盘…')
+    scope = discover_computer_scope()
+    return _scan_roots(scope.roots, cancel, progress, mode='computer',
+                       boundaries=set(scope.boundaries), excluded=list(scope.excluded))
 
 
 @dataclass(frozen=True)
@@ -138,6 +189,9 @@ class ScanResult:
     scanned: int = 0
     bytes_seen: int = 0
     cancelled: bool = False
+    roots: tuple[Path, ...] = ()
+    mode: str = 'folder'
+    excluded: list[str] = field(default_factory=list)
 
     @property
     def potential(self):
@@ -149,7 +203,18 @@ def scan(root: Path, cancel=None, progress: Callable[[str], None] = lambda _: No
     root = assert_safe(Path(root).absolute())
     if not root.is_dir() or root == Path(root.anchor):
         raise UnsafeFile('请选择个人文件夹，不扫描整个系统根目录')
-    result = ScanResult(root)
+    return _scan_roots((root,), cancel, progress, large_bytes, old_days)
+
+
+def _scan_roots(roots, cancel=None, progress=lambda _: None,
+                large_bytes=100 * 1024 * 1024, old_days=180, *, mode='folder',
+                boundaries=None, excluded=None):
+    """One global size/hash index, including duplicates across different disks."""
+    roots = tuple(dict.fromkeys(Path(p).absolute() for p in roots))
+    if not roots:
+        raise UnsafeFile('没有扫描位置')
+    boundaries = boundaries or set()
+    result = ScanResult(roots[0], roots=roots, mode=mode, excluded=excluded or [])
     sizes = defaultdict(list)
     seen = set()
     threshold = time.time_ns() - old_days * 86400 * 10**9
@@ -158,36 +223,55 @@ def scan(root: Path, cancel=None, progress: Callable[[str], None] = lambda _: No
         result.errors.append(str(error))
 
     try:
-        for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+        for root in roots:
             checkpoint(cancel)
-            kept = []
-            for name in sorted(dirs):
-                try:
-                    assert_safe(Path(directory) / name)
-                    kept.append(name)
-                except (OSError, UnsafeFile):
-                    result.skipped += 1
-            dirs[:] = kept
-            for name in sorted(names):
+            try:
+                assert_safe(root)
+                if not root.is_dir():
+                    raise UnsafeFile('磁盘未挂载或目录不可用')
+            except (OSError, UnsafeFile) as error:
+                result.errors.append(f'{root}：{error}')
+                continue
+            for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
                 checkpoint(cancel)
-                try:
-                    item = Snapshot.read(Path(directory) / name)
-                    identity = (item.device, item.inode)
-                    if identity in seen:
+                progress(f'正在遍历 · {directory}')
+                kept = []
+                for name in sorted(dirs):
+                    child = Path(directory) / name
+                    if child in boundaries or (mode == 'computer' and os.path.ismount(child)):
+                        if child not in roots:
+                            result.excluded.append(f'{child}：独立挂载点，未从当前磁盘进入')
                         continue
-                    seen.add(identity)
-                    result.scanned += 1
-                    result.bytes_seen += item.size
-                    if item.size:
-                        sizes[item.size].append(item)
-                    if item.size >= large_bytes or item.mtime_ns < threshold:
-                        result.review.append(item)
-                    if result.scanned % 100 == 0:
-                        progress(f'已读取 {result.scanned:,} 个文件…')
-                except UnsafeFile:
-                    result.skipped += 1
-                except OSError as error:
-                    result.errors.append(str(error))
+                    try:
+                        assert_safe(child)
+                        kept.append(name)
+                    except UnsafeFile as error:
+                        result.skipped += 1
+                        result.excluded.append(f'{child}：{error}')
+                    except OSError as error:
+                        result.skipped += 1
+                        result.errors.append(f'{child}：{error}')
+                dirs[:] = kept
+                for name in sorted(names):
+                    checkpoint(cancel)
+                    try:
+                        item = Snapshot.read(Path(directory) / name)
+                        identity = (item.device, item.inode)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        result.scanned += 1
+                        result.bytes_seen += item.size
+                        if item.size:
+                            sizes[item.size].append(item)
+                        if item.size >= large_bytes or item.mtime_ns < threshold:
+                            result.review.append(item)
+                        if result.scanned % 100 == 0:
+                            progress(f'已读取 {result.scanned:,} 个文件…')
+                    except UnsafeFile:
+                        result.skipped += 1
+                    except OSError as error:
+                        result.errors.append(str(error))
         for size, items in sizes.items():
             checkpoint(cancel)
             if len(items) < 2:

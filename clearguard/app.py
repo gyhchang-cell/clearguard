@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .core import scan, make_plan, execute
+from .core import scan, scan_computer, make_plan, execute
 
 
 def human(value):
@@ -25,7 +25,7 @@ class App:
         self.root = root
         self.root.title('ClearGuard · 空间有数，清理有据')
         self.root.geometry('1120x760')
-        self.root.minsize(850, 580)
+        self.root.minsize(1000, 580)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.events = queue.Queue()
         self.cancel = threading.Event()
@@ -35,7 +35,7 @@ class App:
         self.chosen = set()
         self.rows = {}
         self.folder = tk.StringVar()
-        self.status = tk.StringVar(value='选择个人文件夹开始。扫描只读，不会自动清理。')
+        self.status = tk.StringVar(value='选择文件夹，或点击全机扫描。扫描只读，不会自动清理。')
         self.stats = tk.StringVar(value='所有文件保留原位 · 无上传 · 无后台自动清理')
         style = ttk.Style()
         style.configure('Title.TLabel', font=('Helvetica', 26, 'bold'))
@@ -52,6 +52,8 @@ class App:
         self.pick.pack(side='left', padx=8)
         self.start = ttk.Button(bar, text='开始扫描', command=self.begin)
         self.start.pack(side='left')
+        self.computer = ttk.Button(bar, text='全机扫描', command=lambda: self.begin(whole_machine=True))
+        self.computer.pack(side='left', padx=(8, 0))
         self.stop = ttk.Button(bar, text='取消扫描', command=self.cancel.set, state='disabled')
         self.stop.pack(side='left', padx=(8, 0))
         ttk.Label(outer, textvariable=self.stats, wraplength=1000).pack(anchor='w', pady=16)
@@ -116,7 +118,7 @@ class App:
 
     def lock(self, busy, cleaning=False):
         self.busy, self.cleaning = busy, cleaning
-        for control in (self.start, self.pick, self.entry):
+        for control in (self.start, self.computer, self.pick, self.entry):
             control.configure(state='disabled' if busy else 'normal')
         self.stop.configure(state='normal' if busy and not cleaning else 'disabled')
         self.export.configure(state='normal' if self.result and not busy else 'disabled')
@@ -126,8 +128,10 @@ class App:
         else:
             self.progress.stop()
 
-    def begin(self):
-        if not self.folder.get().strip():
+    def begin(self, whole_machine=False):
+        if self.busy:
+            return
+        if not whole_machine and not self.folder.get().strip():
             self.choose()
             if not self.folder.get():
                 return
@@ -138,12 +142,14 @@ class App:
         self.review.delete(*self.review.get_children())
         self.update_selection()
         self.cancel.clear()
+        self.latest_progress = None
         self.lock(True)
-        self.status.set('正在扫描…')
+        self.status.set('正在发现本地磁盘…' if whole_machine else '正在扫描…')
         folder = Path(self.folder.get()).expanduser()
         def work():
             try:
-                result = scan(folder, self.cancel, self.report_progress)
+                result = (scan_computer(self.cancel, self.report_progress) if whole_machine
+                          else scan(folder, self.cancel, self.report_progress))
                 self.events.put(('scan', result))
             except Exception as error:
                 self.events.put(('error', str(error)))
@@ -190,7 +196,9 @@ class App:
             free = human(shutil.disk_usage(r.root).free)
         except OSError:
             free = '未知'
-        self.stats.set(f'读取 {r.scanned:,} 个文件 · 重复组 {len(r.groups):,} · 可审查重复数据 {human(r.potential)} · 当前磁盘可用 {free}')
+        scope_label = f'全机扫描 · {len(r.roots)} 个候选位置 · ' if r.mode == 'computer' else ''
+        disk_label = '首个磁盘可用' if r.mode == 'computer' else '当前磁盘可用'
+        self.stats.set(scope_label + f'读取 {r.scanned:,} 个文件 · 重复组 {len(r.groups):,} · 可审查重复数据 {human(r.potential)} · {disk_label} {free}')
         for i, group in enumerate(r.groups):
             parent = self.tree.insert('', 'end', text=f'重复组 {i+1} · {len(group.files)} 份', open=True)
             for j, item in enumerate(group.files):
@@ -200,8 +208,10 @@ class App:
                     self.rows[row] = item
         for item in r.review:
             self.review.insert('', 'end', text=item.path.name, values=(human(item.size), str(item.path)))
-        self.write_notes(f'跳过受保护条目/目录：{r.skipped}\n扫描问题：{len(r.errors)}\n' + '\n'.join(r.errors))
-        self.status.set('扫描已取消，结果不可用于清理。' if r.cancelled else '扫描完成。内容相同不代表用途相同，请核对路径再选择。')
+        self.write_notes('扫描范围：\n' + '\n'.join(str(p) for p in (r.roots or (r.root,))) +
+                         f'\n\n跳过受保护条目/目录：{r.skipped}\n未扫描位置：\n' + '\n'.join(r.excluded) +
+                         f'\n\n扫描问题：{len(r.errors)}\n' + '\n'.join(r.errors))
+        self.status.set('扫描已取消，结果不可用于清理。' if r.cancelled else '所列范围扫描结束，保护/无权限位置未扫描，详见规则与扫描问题。')
 
     def toggle(self, event=None):
         if self.busy:
@@ -228,7 +238,8 @@ class App:
         text = ('核验：文件大小 → 完整 SHA-256 → 逐字节比较 → 清理前再次验证。\n'
                 '保护：系统目录、开发项目、应用包、已知云同步目录、占位文件、符号链接、硬链接。\n'
                 '不根据名称、日期、扩展名或 AI 推断“无用”。不清空回收站，不永久删除。\n'
-                '未扫描目录、拒绝访问及取消均不会被当作“已完整扫描”。\n'
+                '全机扫描：本机已挂载磁盘，含已挂载 USB；不进入网络盘、虚拟卷和系统内部卷。\n'
+                '保护目录、拒绝访问、离线磁盘与未挂载位置不在实际覆盖范围内。\n'
                 '数字为逻辑大小；APFS 克隆、压缩、稀疏文件和回收站使实际可释放空间不同。\n'
                 '请在清理前停止同步/写入相关文件；程序无法原子锁住外部程序对路径的全部修改。\n'
                 '运行内存由操作系统管理，本应用不终止进程，不提供“内存加速”。\n\n' + extra)
@@ -264,7 +275,7 @@ class App:
             if not consent.get():
                 return
             audit = filedialog.asksaveasfilename(parent=dialog, title='保存本次清理审计日志（仅保存在本机）',
-                                               initialdir=str(self.result.root), initialfile='clearguard-audit.jsonl', defaultextension='.jsonl')
+                                               initialdir=str(Path.home() if self.result.mode == 'computer' else self.result.root), initialfile='clearguard-audit.jsonl', defaultextension='.jsonl')
             if not audit:
                 return
             # Avoid writing an audit over any scanned file, including keepers.
@@ -288,7 +299,7 @@ class App:
     def save_report(self):
         if not self.result:
             return
-        file = filedialog.asksaveasfilename(title='导出报告：包含本机文件路径，请谨慎分享', initialdir=str(self.result.root), initialfile='clearguard-report.json', defaultextension='.json')
+        file = filedialog.asksaveasfilename(title='导出报告：包含本机文件路径，请谨慎分享', initialdir=str(Path.home() if self.result.mode == 'computer' else self.result.root), initialfile='clearguard-report.json', defaultextension='.json')
         if file:
             try:
                 with Path(file).open('x', encoding='utf-8') as report:
@@ -311,6 +322,8 @@ def main(smoke=False):
         root.update()
         assert not app.chosen and app.result is None
         assert str(app.clear['state']) == 'disabled'
+        assert str(app.computer['text']) == '全机扫描'
+        assert str(app.computer['state']) == 'normal'
         root.destroy()
     else:
         root.mainloop()

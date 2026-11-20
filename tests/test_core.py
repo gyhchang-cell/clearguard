@@ -129,4 +129,102 @@ class SafetyTests(unittest.TestCase):
     def test_refuse_system_root(self):
         with self.assertRaises(core.UnsafeFile): core.scan(Path(self.root.anchor))
 
+
+
+class ComputerScanTests(unittest.TestCase):
+    setUp = SafetyTests.setUp
+    tearDown = SafetyTests.tearDown
+    file = SafetyTests.file
+
+    def test_windows_system_files_protected_during_computer_scan(self):
+        self.file('pagefile.sys'); self.file('hiberfil.sys'); self.file('normal.txt')
+        r = core._scan_roots((self.root,), mode='computer')
+        self.assertEqual(r.scanned, 1)
+        self.assertEqual(r.skipped, 2)
+        self.assertFalse(r.groups)
+
+    def test_cross_volume_duplicates_grouped_once(self):
+        self.file('volume-a/original'); copy = self.file('volume-b/copy')
+        a, b = self.root / 'volume-a', self.root / 'volume-b'
+        scope = core.ComputerScope((a, b), (a, b), ('network: excluded',))
+        with patch.object(core, 'discover_computer_scope', return_value=scope):
+            r = core.scan_computer()
+        self.assertEqual(r.mode, 'computer')
+        self.assertEqual(r.roots, (a, b))
+        self.assertEqual(r.scanned, 2)
+        self.assertEqual(len(r.groups), 1)
+        self.assertEqual(r.potential, 7)
+        self.assertEqual(r.excluded, ['network: excluded'])
+        self.assertEqual(len(core.make_plan(r, [copy]).targets), 1)
+
+    def test_nested_mount_scanned_separately_not_twice(self):
+        self.file('outer/a'); self.file('outer/mount/b')
+        outer, mount = self.root / 'outer', self.root / 'outer/mount'
+        r = core._scan_roots((outer, mount), mode='computer', boundaries={mount})
+        self.assertEqual(r.scanned, 2)
+        self.assertEqual(len(r.groups), 1)
+
+    def test_network_mount_boundary_not_entered(self):
+        self.file('outer/a'); self.file('outer/network/b')
+        outer, network = self.root / 'outer', self.root / 'outer/network'
+        with patch.object(core.Snapshot, 'read', wraps=core.Snapshot.read) as read:
+            r = core._scan_roots((outer,), mode='computer', boundaries={network})
+        self.assertEqual(r.scanned, 1)
+        self.assertFalse(any(network in call.args[0].parents for call in read.call_args_list))
+        self.assertTrue(any(str(network) in e for e in r.excluded))
+
+    def test_cancel_before_discovery_avoids_disk_access(self):
+        event = threading.Event(); event.set()
+        with patch.object(core, 'discover_computer_scope') as discover:
+            r = core.scan_computer(event)
+        discover.assert_not_called()
+        self.assertTrue(r.cancelled)
+
+    def test_cancel_during_multi_root_scan_discards_groups(self):
+        self.file('a/one'); self.file('b/two')
+        event = threading.Event()
+        def progress(_): event.set()
+        r = core._scan_roots((self.root / 'a', self.root / 'b'), event, progress, mode='computer')
+        self.assertTrue(r.cancelled)
+        self.assertFalse(r.groups)
+
+    def test_missing_volume_reported_other_volume_continues(self):
+        self.file('good/a'); self.file('good/b')
+        r = core._scan_roots((self.root / 'missing', self.root / 'good'), mode='computer')
+        self.assertEqual(len(r.groups), 1)
+        self.assertTrue(r.errors)
+
+    def test_new_mount_after_discovery_is_not_entered(self):
+        self.file('outer/a'); self.file('outer/new-mount/b')
+        mount = self.root / 'outer/new-mount'
+        with patch.object(core.os.path, 'ismount', side_effect=lambda p: p == mount):
+            r = core._scan_roots((self.root / 'outer',), mode='computer')
+        self.assertEqual(r.scanned, 1)
+        self.assertTrue(r.excluded)
+
+    @unittest.skipIf(os.name == 'nt', 'macOS mount-path semantics are verified on macOS CI')
+    def test_darwin_scope_skips_internal_and_network_volumes(self):
+        from types import SimpleNamespace as Part
+        mounts = [Part(mountpoint='/', fstype='apfs', opts='ro'),
+                  Part(mountpoint='/System/Volumes/Data', fstype='apfs', opts='rw'),
+                  Part(mountpoint='/Volumes/USB', fstype='exfat', opts='rw'),
+                  Part(mountpoint='/Volumes/Network', fstype='smbfs', opts='rw')]
+        with patch('psutil.disk_partitions', return_value=mounts), patch.object(core.sys, 'platform', 'darwin'):
+            scope = core.discover_computer_scope()
+        self.assertEqual(set(scope.roots), {Path('/'), Path('/Volumes/USB')})
+        self.assertIn(Path('/Volumes/Network'), scope.boundaries)
+        self.assertEqual(len(scope.excluded), 2)
+
+    def test_windows_remote_flag_excludes_ntfs_share(self):
+        from types import SimpleNamespace as Part
+        # Native drive-path behavior runs on Windows CI; POSIX fixture paths
+        # let this filtering test run on either OS without touching any drive.
+        local, remote = self.root / 'local', self.root / 'remote'
+        mounts = [Part(mountpoint=str(local), fstype='NTFS', opts='rw,fixed'),
+                  Part(mountpoint=str(remote), fstype='NTFS', opts='rw,remote')]
+        with patch('psutil.disk_partitions', return_value=mounts), patch.object(core.sys, 'platform', 'win32'):
+            scope = core.discover_computer_scope()
+        self.assertEqual(scope.roots, (local,))
+        self.assertIn(remote, scope.boundaries)
+
 if __name__ == '__main__': unittest.main()
