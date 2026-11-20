@@ -144,6 +144,23 @@ class ComputerScanTests(unittest.TestCase):
         self.assertEqual(r.skipped, 2)
         self.assertFalse(r.groups)
 
+    def test_windows_handle_ctime_semantics_keep_identity_and_birthtime_guards(self):
+        from dataclasses import replace
+        from types import SimpleNamespace
+        item = core.Snapshot.read(self.file('identity'))
+        item = replace(item, birthtime_ns=123)
+        observed = SimpleNamespace(st_dev=item.device, st_ino=item.inode,
+                                   st_size=item.size, st_mtime_ns=item.mtime_ns,
+                                   st_nlink=item.links, st_ctime_ns=item.ctime_ns + 999,
+                                   st_birthtime_ns=123)
+        with patch.object(core.sys, 'platform', 'win32'):
+            item.verify_handle(observed)
+            observed.st_birthtime_ns = 124
+            with self.assertRaises(core.UnsafeFile): item.verify_handle(observed)
+            observed.st_birthtime_ns = 123
+            observed.st_ino += 1
+            with self.assertRaises(core.UnsafeFile): item.verify_handle(observed)
+
     def test_fresh_file_snapshot_matches_open_handle(self):
         original_digest = core.digest
         def measured(item, cancel=None):

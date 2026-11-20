@@ -122,6 +122,7 @@ class Snapshot:
     device: int
     inode: int
     links: int
+    birthtime_ns: int | None = None
 
     @classmethod
     def read(cls, path: Path):
@@ -129,21 +130,35 @@ class Snapshot:
         s = path.lstat()
         if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1:
             raise UnsafeFile('非普通文件或硬链接被保护')
-        return cls(path, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_dev, s.st_ino, s.st_nlink)
+        return cls(path, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_dev, s.st_ino, s.st_nlink,
+                   getattr(s, 'st_birthtime_ns', None) if sys.platform == 'win32' else None)
 
     def verify(self):
         if Snapshot.read(self.path) != self:
             raise UnsafeFile('文件在扫描后发生变化，请重新扫描')
 
 
+    def verify_handle(self, observed):
+        expected = (self.device, self.inode, self.size, self.mtime_ns, self.links)
+        actual = (observed.st_dev, observed.st_ino, observed.st_size,
+                  observed.st_mtime_ns, observed.st_nlink)
+        if actual != expected:
+            raise UnsafeFile('打开的文件身份、大小或修改时间已变化')
+        if sys.platform == 'win32':
+            # CPython Windows stat/lstat ctime can mean creation time while
+            # fstat ctime means metadata-change time. Compare explicit birthtime
+            # where available instead of equating those incompatible fields.
+            if self.birthtime_ns is not None and getattr(observed, 'st_birthtime_ns', None) != self.birthtime_ns:
+                raise UnsafeFile('打开的文件创建时间已变化')
+        elif observed.st_ctime_ns != self.ctime_ns:
+            raise UnsafeFile('打开的文件元数据时间已变化')
+
+
 def digest(item: Snapshot, cancel=None):
     item.verify()
     flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
     with os.fdopen(os.open(item.path, flags), 'rb') as stream:
-        s = os.fstat(stream.fileno())
-        if (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns) != (
-                item.device, item.inode, item.size, item.mtime_ns, item.ctime_ns):
-            raise UnsafeFile('打开的文件已变化')
+        item.verify_handle(os.fstat(stream.fileno()))
         h = hashlib.sha256()
         while True:
             checkpoint(cancel)

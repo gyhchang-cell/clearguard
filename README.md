@@ -2,7 +2,7 @@
 
 **空间有数，清理有据。** An offline, consent-first duplicate finder for macOS and Windows.
 
-> 0.2.0 experimental preview / 实验预览版。先用可恢复的测试文件体验，再处理重要资料。
+> 0.2.1 experimental preview / 实验预览版。先用可恢复的测试文件体验，再处理重要资料。
 
 ClearGuard scans a folder you choose or discovers local disks with Whole-computer Scan, shows exact duplicate evidence and lets you review a concrete cleanup plan. Nothing is selected by default. Cleanup sends explicitly approved duplicates to the native Trash / Recycle Bin. It never empties it or falls back to permanent deletion.
 
