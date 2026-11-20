@@ -1,0 +1,30 @@
+name: Desktop verification and builds
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.cache/pycache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e ".[build]"
+      - run: python -m unittest discover -s tests -v
+      - run: python tests/gui_smoke.py
+      - run: python build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClearGuard-${{ matrix.os }}
+          path: dist/
